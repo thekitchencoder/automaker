@@ -13,9 +13,11 @@
 5. [External CLI Tools: Capabilities & Limitations](#external-cli-tools-capabilities--limitations)
 6. [Alternative Providers & Local LLMs](#alternative-providers--local-llms)
 7. [Integration Patterns](#integration-patterns)
-8. [Gaps & Opportunities](#gaps--opportunities)
-9. [Design Considerations for Planning](#design-considerations-for-planning)
-10. [Open Questions](#open-questions)
+8. [Claude Code-Only Multi-Provider Strategy](#claude-code-only-multi-provider-strategy)
+9. [Local LLMs as Intelligent Tools (A2A Pattern)](#local-llms-as-intelligent-tools-a2a-pattern)
+10. [Gaps & Opportunities](#gaps--opportunities)
+11. [Design Considerations for Planning](#design-considerations-for-planning)
+12. [Open Questions](#open-questions)
 
 ---
 
@@ -23,13 +25,16 @@
 
 Automaker already has a **sophisticated multi-provider architecture** with 6 registered providers (Claude, Cursor, Codex, OpenCode, Gemini, Copilot) and a registry-based `ProviderFactory` for model routing. It also supports **Claude-compatible providers** (OpenRouter, MiniMax, GLM) via API endpoint configuration. Per-phase model selection exists via `PhaseModelConfig`.
 
-The key gaps are:
+**Key finding**: The most pragmatic path forward avoids adding new CLI tools or new provider implementations. Instead, it leverages **Claude Code as the single CLI tool** with `ClaudeCompatibleProvider` configurations pointing at different backends. LM Studio and Ollama both support Anthropic-compatible endpoints natively — no proxy needed. Per-phase provider routing already works via `PhaseModelEntry.providerId`.
 
-1. **No direct local LLM support** — no Ollama, LM Studio, or vLLM provider exists
-2. **CLI providers are limited** to their own model ecosystems (each CLI has its own auth/model set)
-3. **Feature-level model assignment** exists but is per-feature, not per-agent-role
-4. **Claude-compatible providers** only work for the Claude provider path — they can't route to fundamentally different APIs (OpenAI-compatible, etc.)
-5. **No OpenAI-compatible API provider** — for local/alternative models that expose OpenAI-format APIs
+**The most compelling architecture** is using local LLMs as **intelligent tools** (via MCP servers or extended subagents) rather than as replacement providers. The frontier model (Opus) stays as orchestrator and delegates grunt work (linting, single-class implementation, test generation, commit messages) to cheap/local models via tool calls. This works today with MCP tools and zero Automaker code changes.
+
+### Key gaps to address:
+
+1. **Subagents don't support per-provider routing** — `AgentDefinition.model` is locked to `'sonnet' | 'opus' | 'haiku' | 'inherit'`, no `providerId` field
+2. **Auto-mode doesn't pass subagents through** — `buildExecOpts()` in `agent-executor.ts` omits the `agents` field
+3. **No per-pipeline-step provider override** — all steps use the same model
+4. **MCP-based delegation is one-shot** — local model can't do multi-turn tool use through an MCP tool call
 
 ---
 
@@ -539,6 +544,323 @@ Combine patterns based on quality tier:
 
 ---
 
+## Claude Code-Only Multi-Provider Strategy
+
+The above patterns assume adding new provider code or external CLI tools. A simpler approach exists: **use Claude Code as the single CLI tool and route to different backends via `ClaudeCompatibleProvider` configurations** that swap `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and model IDs per invocation.
+
+This already works for any backend that speaks the Anthropic Messages API — including LM Studio (native Anthropic endpoint support), MiniMax, and OpenRouter. No additional CLI tools needed.
+
+### How It Works Today
+
+The `ClaudeProvider.executeQuery()` method in `apps/server/src/providers/claude-provider.ts` calls the Claude Agent SDK's `query()` function. It passes an `env` object constructed by `buildEnv()`:
+
+```typescript
+// claude-provider.ts:228
+env: buildEnv(providerConfig, credentials),
+```
+
+`buildEnv()` constructs a **clean environment** when a provider is configured:
+
+```typescript
+function buildEnv(providerConfig?, credentials?) {
+  const env = {};
+
+  if (providerConfig) {
+    // Clean switch — only provider settings, no inherited process.env
+    env['ANTHROPIC_BASE_URL'] = providerConfig.baseUrl;
+
+    if (providerConfig.useAuthToken) {
+      env['ANTHROPIC_AUTH_TOKEN'] = resolvedApiKey;
+    } else {
+      env['ANTHROPIC_API_KEY'] = resolvedApiKey;
+    }
+
+    if (providerConfig.timeoutMs) {
+      env['API_TIMEOUT_MS'] = String(providerConfig.timeoutMs);
+    }
+    if (providerConfig.disableNonessentialTraffic) {
+      env['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'] = '1';
+    }
+  }
+  // + system vars (PATH, HOME, SHELL, etc.)
+  return env;
+}
+```
+
+The SDK spawns a Claude Code subprocess with this environment. The subprocess sees the custom `ANTHROPIC_BASE_URL` and routes all API calls to that endpoint.
+
+### Per-Phase Provider Routing (Already Supported)
+
+Each `PhaseModelEntry` already has a `providerId` field:
+
+```typescript
+interface PhaseModelEntry {
+  providerId?: string;   // → links to a ClaudeCompatibleProvider by ID
+  model: ModelId;
+  thinkingLevel?: ThinkingLevel;
+}
+```
+
+When a phase model has a `providerId`, `getProviderByModelId()` in `apps/server/src/lib/settings-helpers.ts` looks up the matching `ClaudeCompatibleProvider` from settings and passes it through to `ClaudeProvider.executeQuery()` as `claudeCompatibleProvider`. The full chain:
+
+```
+PhaseModelEntry.providerId
+  → getProviderByModelId() resolves ClaudeCompatibleProvider
+  → ExecuteOptions.claudeCompatibleProvider = provider
+  → ClaudeProvider.executeQuery() receives it
+  → buildEnv(provider, credentials) constructs clean env
+  → SDK subprocess runs with custom ANTHROPIC_BASE_URL
+```
+
+This means you can already assign LM Studio or MiniMax to specific phases (enhancement, commit messages, etc.) via the settings UI — configure a `ClaudeCompatibleProvider` with the local base URL, then select its models in the phase model dropdowns.
+
+### What LM Studio Native Anthropic Support Enables
+
+LM Studio exposes an Anthropic-compatible endpoint at `http://localhost:1234/v1` that directly accepts the Claude Messages API format. This means:
+
+- No proxy (LiteLLM) needed
+- No additional CLI tools needed
+- Configure as a `ClaudeCompatibleProvider` with `baseUrl: "http://localhost:1234/v1"`
+- Claude Agent SDK connects to it as if it were Anthropic's API
+- Full tool use support (if the local model supports function calling)
+
+### Gaps in the Claude Code-Only Approach
+
+1. **Subagents don't support per-provider routing** — `AgentDefinition` only has `model: 'sonnet' | 'opus' | 'haiku' | 'inherit'`, no `providerId` or `baseUrl` field. Subagents always inherit the parent's environment.
+
+2. **Auto-mode doesn't pass subagents** — `buildExecOpts()` in `agent-executor.ts:730` omits the `agents` field entirely, so auto-mode feature execution can't use subagents at all.
+
+3. **Agent discovery validates model against Claude aliases only** — `agent-discovery.ts:66` restricts model to `['sonnet', 'opus', 'haiku', 'inherit']`. Can't specify a custom provider model ID.
+
+4. **No per-pipeline-step provider override** — `pipeline-orchestrator.ts:117` uses `resolveModelString(feature.model)` for all steps. Can't lint with a cheap local model and implement with Opus.
+
+---
+
+## Local LLMs as Intelligent Tools (A2A Pattern)
+
+Instead of treating local LLMs as alternative *providers* that replace the frontier model, treat them as **intelligent tools** that the frontier model *delegates to*. The expensive Opus model stays in the driver's seat — planning, coordinating, reviewing — and offloads commodity grunt work to cheaper/local models via tool calls.
+
+### Concept
+
+```
+┌─────────────────────────────────────────────────┐
+│  Claude Opus (frontier model — orchestrator)    │
+│  Plans architecture, reviews code, coordinates  │
+└───┬──────────┬──────────┬──────────┬────────────┘
+    │          │          │          │
+    ▼          ▼          ▼          ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────────┐
+│ Lint   │ │ Impl   │ │ Test   │ │ Format     │
+│ Agent  │ │ Agent  │ │ Writer │ │ Agent      │
+│(local) │ │(local) │ │(local) │ │(local)     │
+└────────┘ └────────┘ └────────┘ └────────────┘
+  LM Studio   Ollama    LM Studio   Ollama
+```
+
+The frontier model uses `Task` tool calls (subagents) or MCP tool calls to invoke local models for:
+- Single class/function implementation from a clear spec
+- Linting and formatting checks
+- Test generation from interfaces
+- Documentation generation
+- Commit message drafting
+- File description generation
+
+### Implementation Approach A: MCP Tool Server (Works Today, Zero Code Changes)
+
+Write an MCP server that wraps local LLM calls as tools. Register it in Automaker's MCP settings. The frontier model calls these tools naturally.
+
+```typescript
+// mcp-local-llm-tools/src/index.ts
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const server = new McpServer({ name: "local-llm-tools" });
+
+server.tool(
+  "local_implement_class",
+  {
+    className: z.string(),
+    spec: z.string(),
+    language: z.string(),
+    existingImports: z.string().optional(),
+  },
+  async ({ className, spec, language, existingImports }) => {
+    const response = await fetch("http://localhost:1234/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "lm-studio" },
+      body: JSON.stringify({
+        model: "qwen2.5-coder-32b",
+        max_tokens: 8192,
+        messages: [{
+          role: "user",
+          content: `Implement this ${language} class.\n\nClass: ${className}\nSpec: ${spec}\n${existingImports ? `Imports: ${existingImports}` : ""}\n\nReturn ONLY the implementation code.`
+        }]
+      })
+    });
+    const result = await response.json();
+    return { content: [{ type: "text", text: result.content[0].text }] };
+  }
+);
+
+server.tool(
+  "local_lint_check",
+  {
+    code: z.string(),
+    language: z.string(),
+    rules: z.string().optional(),
+  },
+  async ({ code, language, rules }) => {
+    const response = await fetch("http://localhost:1234/v1/messages", {
+      // ... similar pattern, prompt asks for lint issues
+    });
+    return { content: [{ type: "text", text: result.content[0].text }] };
+  }
+);
+
+server.tool(
+  "local_generate_tests",
+  {
+    sourceCode: z.string(),
+    framework: z.string(),
+    coverageGoal: z.string().optional(),
+  },
+  async ({ sourceCode, framework, coverageGoal }) => {
+    // ... local model generates tests
+  }
+);
+```
+
+MCP server configuration in Automaker settings:
+
+```json
+{
+  "mcpServers": {
+    "local-llm-tools": {
+      "command": "node",
+      "args": ["/path/to/mcp-local-llm-tools/dist/index.js"]
+    }
+  }
+}
+```
+
+**Pros**:
+- Works today with zero Automaker code changes
+- Frontier model decides when to delegate (intelligent routing)
+- Each tool can use a different local model/endpoint
+- Tools are strongly typed with schemas
+- MCP servers are already supported in both chat and auto-mode
+
+**Cons**:
+- Tool calls are one-shot (no multi-turn within the local model call)
+- Local model can't use tools itself (no recursive tool use)
+- Frontier model must craft the delegation prompt carefully
+- No streaming from local model back through the tool result
+
+### Implementation Approach B: Subagents with Per-Provider Config (Requires Changes)
+
+Extend `AgentDefinition` so each subagent can target a different `ClaudeCompatibleProvider`. The frontier model spawns subagents via the `Task` tool, and each subagent runs as a full Claude Code subprocess — but pointed at a different backend.
+
+```typescript
+// Extended AgentDefinition
+interface AgentDefinition {
+  description: string;
+  prompt: string;
+  tools?: string[];
+  model?: string;           // Any model ID, not just Claude aliases
+  providerId?: string;       // Reference a ClaudeCompatibleProvider by ID
+}
+```
+
+AGENT.md file example (`~/.claude/agents/local-implementer/AGENT.md`):
+
+```markdown
+---
+description: Implement a single class or function from a detailed specification
+tools: Read, Write, Edit, Bash
+model: qwen2.5-coder-32b
+providerId: lm-studio-local
+---
+You are a code implementation specialist. You receive a detailed specification
+for a single class or function and implement it precisely. Focus only on the
+implementation — do not modify other files or add tests unless asked.
+```
+
+The frontier model would then delegate via the `Task` tool:
+
+```
+Task: "local-implementer"
+Prompt: "Implement the UserRepository class per this spec: ..."
+```
+
+The changes required in Automaker:
+
+1. **`libs/types/src/provider.ts`** — Extend `AgentDefinition.model` to accept any string, add `providerId`
+2. **`apps/server/src/lib/agent-discovery.ts`** — Parse `providerId` from AGENT.md frontmatter
+3. **`apps/server/src/providers/claude-provider.ts`** — When building SDK options, resolve `providerId` for each agent and inject the corresponding `ClaudeCompatibleProvider` env
+4. **`apps/server/src/services/agent-executor.ts`** — Pass `agents` in `buildExecOpts()` so auto-mode can use subagents
+5. **`apps/server/src/services/auto-mode/facade.ts`** — Load and pass subagents configuration
+
+**Pros**:
+- Subagents are full Claude Code sessions — multi-turn, tool use, file access
+- Each subagent independently configurable (model, tools, provider)
+- Frontier model controls delegation via `Task` tool
+- Reuses existing AGENT.md discovery and settings UI
+
+**Cons**:
+- Requires Automaker code changes
+- Each subagent subprocess adds overhead (~2-5s startup)
+- Depends on how Claude Agent SDK handles `agents` with custom env per agent (may need SDK changes)
+- Local model quality for multi-turn agentic work is unproven
+
+### Implementation Approach C: A2A Protocol Integration (Future)
+
+Google's Agent-to-Agent (A2A) protocol provides a standardized way for agents to discover, negotiate, and delegate work to each other. Local LLMs could register as A2A-compliant agents that the frontier model discovers and delegates to.
+
+```
+┌──────────────────────────┐
+│ Claude Opus (A2A Client) │
+│ Discovers agents via     │
+│ /.well-known/agent.json  │
+└───────┬──────────────────┘
+        │ A2A task delegation
+        ▼
+┌──────────────────────────┐
+│ Local A2A Agent Server   │
+│ Wraps LM Studio/Ollama   │
+│ Exposes agent skills:    │
+│  - implement-class       │
+│  - lint-check            │
+│  - generate-tests        │
+└──────────────────────────┘
+```
+
+This is more future-looking — A2A is still nascent — but the architecture aligns well with the concept. The MCP approach (Approach A) is essentially a simpler version of this that works today.
+
+### Recommended Approach: MCP Now, Subagents Next
+
+**Phase 1 (now)**: Build MCP tool servers that wrap local LLM calls for specific tasks. Test with LM Studio's Anthropic endpoint. Zero Automaker changes required. Validate which tasks local models handle well enough.
+
+**Phase 2 (next)**: Based on Phase 1 learnings, extend `AgentDefinition` with `providerId` support and wire subagents into auto-mode. This gives local models full agentic capability (multi-turn, tools) for tasks where one-shot MCP tools aren't enough.
+
+**Phase 3 (future)**: Standardize on A2A protocol as it matures, allowing any agent (local or remote) to register and be discovered.
+
+### Task Suitability for Local vs Frontier Models
+
+| Task | Frontier Model | Local LLM | Notes |
+|------|---------------|-----------|-------|
+| Architecture planning | Required | Unsuitable | Needs deep reasoning, full context |
+| Multi-file refactoring | Required | Unsuitable | Needs broad codebase awareness |
+| Code review | Required | Assist | Local can check style; frontier checks logic |
+| Single class implementation | Optional | Good fit | Clear spec → implementation is mechanical |
+| Test generation | Optional | Good fit | Interface → tests is pattern-matchable |
+| Linting / formatting | Unnecessary | Good fit | Rules-based, local models handle well |
+| Commit messages | Unnecessary | Good fit | Diff → description is straightforward |
+| File descriptions | Unnecessary | Good fit | Read file → summarize |
+| Documentation | Optional | Good fit | Clear input → prose output |
+| Bug diagnosis | Required | Unsuitable | Needs reasoning about side effects |
+
+---
+
 ## Gaps & Opportunities
 
 ### Gap 1: No OpenAI-Compatible API Provider
@@ -668,57 +990,66 @@ Local LLMs enable testing without API costs:
 
 ## Open Questions
 
-### Architecture Questions
+### Claude Code-Only Strategy
 
-1. **Should local LLMs be a first-class provider or go through an existing gateway?**
-   - First-class `OpenAICompatProvider`: More control, no external dependency
-   - Via OpenCode CLI: Less code, more models, but requires CLI
-   - Via OpenRouter `ClaudeCompatibleProvider`: Minimal code change, but not truly local
+1. **Is the `ClaudeCompatibleProvider` + LM Studio Anthropic endpoint sufficient for all local model use cases?**
+   - Works for models that support tool use (Qwen2.5-Coder, DeepSeek-Coder)
+   - May not work for simpler models that lack function calling
+   - Need to test: what happens when the SDK sends tool definitions to a model that doesn't support them?
 
-2. **Should the `ClaudeCompatibleProvider` system be extended or should a parallel `OpenAICompatibleProvider` system be created?**
-   - Extending: Reuses UI/settings, but the Claude provider becomes complex
-   - Parallel: Clean separation, but duplicates UI/settings work
+2. **Should local provider auto-detection be added?**
+   - Probe `localhost:1234` (LM Studio) and `localhost:11434` (Ollama) on startup
+   - Auto-create `ClaudeCompatibleProvider` entries for discovered endpoints
+   - Or keep it manual — user configures providers explicitly
 
-3. **How should tool compatibility be handled for non-tool-supporting models?**
-   - Degrade gracefully: Run in text-only mode for simple tasks
-   - Error: Prevent assignment to tool-requiring phases
-   - Adapt: Convert tool calls to text descriptions
+### Intelligent Tools (A2A) Strategy
 
-### Product Questions
+3. **MCP tools (Phase 1) vs extended subagents (Phase 2) — when to transition?**
+   - MCP tools are one-shot: send prompt, get result. No multi-turn, no tool use within the local model
+   - Subagents with `providerId` would be full Claude Code sessions against the local endpoint
+   - Which tasks genuinely need multi-turn? (Implementation may; linting doesn't)
 
-4. **What's the minimum viable scope?**
-   - Just Ollama support for basic tasks?
-   - Full OpenAI-compatible provider with UI?
-   - Per-pipeline-step model assignment?
+4. **How should the frontier model know which tools delegate to local models?**
+   - Naming convention: `local_*` prefix (e.g., `local_implement_class`, `local_lint`)
+   - Tool descriptions that explicitly say "delegates to a local model"
+   - Let the frontier model discover capabilities from tool schemas
 
-5. **Should provider health monitoring be added?**
-   - Ping/latency checks for configured providers
-   - Automatic failover when a provider is down
-   - Cost tracking per provider
+5. **Quality validation for local model output?**
+   - Frontier model reviews local model output before accepting it
+   - Automated checks (compilation, lint pass) before returning tool result
+   - Cost of re-doing work if local model output is bad vs savings from delegation
 
-6. **Should there be "provider profiles" (presets for common setups)?**
-   - "Cost-optimized": Local for basic, cloud for complex
-   - "Speed-optimized": Fastest model per task
-   - "Privacy-first": Local models only
-   - "Free tier": OpenCode free + local only
+6. **Should MCP tool servers ship with Automaker or be user-configured?**
+   - Built-in: Automaker includes a set of local-LLM MCP tools out of the box
+   - Templates: Provide example MCP servers users can customize
+   - User-only: Document the pattern, let users build their own
 
-### Technical Questions
+### Subagent Architecture
 
-7. **How to handle streaming differences between API formats?**
-   - Anthropic: SSE with `event: message_start`, `content_block_delta`, etc.
-   - OpenAI: SSE with `data: {"choices":[{"delta":{"content":"..."}}]}`
-   - Need adapter layer in provider
+7. **How does the Claude Agent SDK handle per-agent environment overrides?**
+   - The SDK's `agents` option passes `AgentDefinition` objects
+   - Today there's no per-agent env/baseUrl — agents inherit the parent's env
+   - Would need to either: (a) extend the SDK, or (b) have Automaker resolve `providerId` and inject env vars before passing to SDK
+   - Need to verify: can `AgentDefinition` carry opaque config that the SDK passes through?
 
-8. **How to handle conversation history format differences?**
-   - Claude: `messages` array with `content` blocks
-   - OpenAI: `messages` array with `content` string
-   - Need conversion utilities (similar to existing `convertHistoryToMessages()`)
+8. **Should `buildExecOpts()` always pass agents, or only when explicitly configured?**
+   - Today auto-mode skips agents entirely (`agent-executor.ts:730`)
+   - Passing agents adds the `Task` tool to the frontier model's toolkit
+   - Risk: frontier model may over-delegate when it shouldn't
+   - Mitigation: only inject agents when the user has explicitly configured subagents
 
-9. **How to handle model capability discovery for dynamic providers?**
-   - Ollama: `GET /api/tags` for available models
-   - OpenCode: `opencode models` CLI command
-   - LM Studio: Model list via API
-   - Need a `discoverModels()` method on providers
+### Operational
+
+9. **How to handle local model unavailability during a feature run?**
+   - Local model endpoint could be down (LM Studio not running, model not loaded)
+   - MCP tool call fails → frontier model gets error → retries or does it itself
+   - Subagent fails → feature execution fails (harder to recover)
+   - Should there be a health check before delegating?
+
+10. **Cost tracking for mixed-provider execution?**
+    - Frontier model usage: tracked by Anthropic API (existing)
+    - Local model usage: free but still worth tracking (tokens, time)
+    - Could help users understand cost/quality tradeoffs of their delegation config
 
 ---
 
@@ -759,6 +1090,18 @@ Local LLMs enable testing without API costs:
 | `apps/server/src/services/pipeline-orchestrator.ts` | Pipeline step execution |
 | `apps/server/src/services/agent-executor.ts` | Core agent execution engine |
 | `apps/server/src/services/execution-service.ts` | Feature execution lifecycle |
+
+### Subagent & MCP Infrastructure
+
+| File | Description |
+|------|-------------|
+| `apps/server/src/lib/agent-discovery.ts` | Discovers AGENT.md files from `~/.claude/agents/` and `.claude/agents/` |
+| `apps/server/src/lib/settings-helpers.ts:418` | `getCustomSubagents()` — merges global + project subagents |
+| `apps/server/src/lib/settings-helpers.ts:705` | `getProviderByModelId()` — resolves model → ClaudeCompatibleProvider |
+| `apps/server/src/services/agent-service.ts:391` | Loads subagents and passes as `agents` in chat mode |
+| `apps/server/src/services/agent-executor.ts:730` | `buildExecOpts()` — omits `agents` (auto-mode gap) |
+| `apps/server/src/services/auto-mode/facade.ts:285` | Auto-mode execution options — no `agents` field |
+| `apps/server/src/routes/settings/routes/discover-agents.ts` | API route for agent discovery |
 
 ### Documentation
 
