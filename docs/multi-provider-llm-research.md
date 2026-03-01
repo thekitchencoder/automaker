@@ -296,15 +296,57 @@ This is limited to Claude model aliases — it cannot reference Cursor, Codex, O
 - **Multi-provider**: Partially — accesses multiple model families through GitHub's proxy
 - **Key limitation**: Requires GitHub Copilot subscription
 
+### Detailed CLI Programmatic Usage
+
+#### Claude Code — Headless / SDK Modes
+
+- **`--print` / `-p` flag**: Non-interactive execution, exits after response. Combine with `--output-format json` or `stream-json` for structured parsing
+- **`--model`**: Select model (opus, sonnet, haiku)
+- **`--system-prompt` / `--append-system-prompt`**: Control system instructions
+- **`--allowedTools`**: Pre-approve tools (e.g., `Bash(git diff *)`)
+- **`--dangerously-skip-permissions`**: For trusted containers only
+- **`--worktree` / `-w`**: Isolated git worktree sessions
+- **`--agents`**: Define sub-agents as JSON
+- **Agent SDK**: Spawns Claude Code as subprocess, communicates via stdin/stdout JSON. Provides custom tools via in-process MCP servers, subagent configuration, hooks, and permission modes
+- **Non-Anthropic workarounds**: LiteLLM proxy (`ANTHROPIC_BASE_URL` override), OpenRouter, or direct Anthropic-compatible providers. Policy note: Anthropic prohibits using OAuth tokens from subscriptions in third-party tools, but using third-party *models* in Claude Code via API keys is permitted
+
+#### OpenCode — Most Flexible Gateway
+
+- **`opencode run`**: Non-interactive mode. Flags: `--model provider/model`, `--format json`, `--quiet`, `--file`, `--session`, `--continue`
+- **`opencode serve`**: Headless HTTP server with OpenAPI endpoint (protectable with `OPENCODE_SERVER_PASSWORD`)
+- **`opencode run --attach`**: Attach to running server to avoid MCP cold starts
+- **`opencode web`**: Web UI mode
+- **`opencode acp`**: Agent Client Protocol via stdin/stdout nd-JSON
+- **Configuration**: `opencode.json` with `provider`, `model` (format: `provider_id/model_id`), `small_model` for lightweight tasks, `disabled_providers` / `enabled_providers`, model variant cycling
+- **Providers supported**: OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI, Groq, OpenRouter, Cerebras, Deep Infra, Fireworks AI, MiniMax, Moonshot AI, DeepSeek, GitLab Duo, **Ollama**, Docker Model Runner, any OpenAI-compatible endpoint
+
+#### Codex CLI — OpenAI with Local Support
+
+- **Models**: GPT-5.3 Codex (primary), GPT-5.1 Codex Max, GPT-5 Codex Mini
+- **`--oss` flag**: Enables local model support (defaults to Ollama with `gpt-oss:20b`). Note: hardcodes Ollama-specific `/api/tags` and `/api/pull` calls — incompatible with non-Ollama OpenAI-compatible servers
+- **Azure**: Configure via `config.toml` with Azure-specific `base_url`
+- **Custom providers**: Via `config.toml` profiles with `model_provider`, `base_url`, `env_key`
+- **In-session**: `/model` command for switching
+
+#### Aider — Broadest Provider Support
+
+- **Cloud**: OpenAI, Anthropic, Google, Azure, Cohere, DeepSeek, xAI, Vertex AI, Amazon Bedrock
+- **Aggregators**: OpenRouter, GitHub Copilot, Fireworks AI
+- **Local**: `aider --model ollama_chat/<model-name>` (auto-manages context window, recommended: qwen2.5-coder, deepseek-coder-v2)
+- **Configuration**: API keys via env vars, `.env`, or `--api-key provider=<key>`. YAML config for persistence
+- **Architect mode**: Uses capable model for planning, cheaper model for execution
+- **Note**: Not currently integrated into Automaker, but its architecture pattern (architect mode, multi-provider config) is worth studying
+
 ### Summary Table
 
-| CLI Tool       | Provider Count | Local LLM | OpenAI-Compat API | Custom Endpoints |
-|---------------|---------------|-----------|-------------------|-----------------|
-| Claude (SDK)  | 1 + compat    | No        | No                | Yes (Anthropic) |
-| OpenCode      | 15+           | Via proxy  | No                | Yes             |
-| Codex         | 1             | No        | N/A               | No              |
-| Gemini        | 1             | No        | No                | No              |
-| Copilot       | 3+            | No        | No                | No              |
+| CLI Tool       | Provider Count | Local LLM | OpenAI-Compat API | Custom Endpoints | Headless JSON |
+|---------------|---------------|-----------|-------------------|-----------------|--------------|
+| Claude (SDK)  | 1 + compat    | Via proxy  | No                | Yes (Anthropic) | Yes (SDK) |
+| OpenCode      | 20+           | Ollama native | Yes            | Yes             | Yes |
+| Codex         | 1 + Azure     | Ollama (--oss) | Limited       | Via config.toml | Limited |
+| Gemini        | 1             | No        | No                | No              | Yes |
+| Copilot       | 3+            | No        | No                | No              | Yes |
+| Aider         | 15+           | Ollama native | Yes            | Yes             | Limited |
 
 ---
 
@@ -395,6 +437,38 @@ Groq         → https://api.groq.com/openai/v1
 
 **A single "OpenAI-compatible API" provider would unlock all of the above.**
 
+### The LiteLLM Bridge Option
+
+[LiteLLM](https://docs.litellm.ai/) is a proxy that translates 100+ providers into both OpenAI (`/v1/chat/completions`) AND Anthropic (`/v1/messages`) format with ~8ms P95 latency overhead. This means any tool that speaks either format can reach any provider. Particularly relevant for Claude Code, which requires Anthropic-format APIs — LiteLLM can translate DeepSeek, Mistral, or local Ollama into Anthropic format.
+
+### API Compatibility Matrix
+
+| Provider | OpenAI Compat | Anthropic Compat | Native SDK |
+|---|---|---|---|
+| Ollama | Yes (built-in) | Yes (built-in) | Yes |
+| LM Studio | Yes (built-in) | Yes (built-in) | Yes |
+| llama.cpp | Yes (built-in) | No | No |
+| vLLM | Yes (built-in) | No | No |
+| MiniMax | Yes | Yes | Yes |
+| DeepSeek | Yes (native) | Via proxy | Yes |
+| Mistral | Yes (native) | Via proxy | Yes |
+| Groq | Yes (native) | Via proxy | No |
+| Google Gemini | Via proxy | Via proxy | Yes |
+
+### Cost Comparison (per MTok, input/output)
+
+| Provider/Model | Input | Output | Context | Best For |
+|---|---|---|---|---|
+| Claude Opus 4.6 | $5.00 | $25.00 | 1M | Complex reasoning, architecture |
+| Claude Sonnet 4.6 | $3.00 | $15.00 | 1M | General coding workhorse |
+| GPT-5.3 Codex | Subscription | Subscription | 256K | OpenAI ecosystem coding |
+| DeepSeek V3.2 | $0.28 | $0.42 | 128K | Budget coding, reasoning |
+| MiniMax M2.5 | ~$0.24 | ~$1.20 | 196K | Budget agentic coding |
+| Mistral Devstral Small | $0.10 | $0.30 | 131K | Open-source, self-hosted coding |
+| Groq GPT-OSS-120B | $0.15 | $0.75 | varies | Speed-critical inference |
+| Groq GPT-OSS-20B | $0.10 | $0.50 | varies | Ultra-fast, budget |
+| Ollama (local) | Free | Free | Varies | Privacy, offline, zero cost |
+
 ---
 
 ## Integration Patterns
@@ -439,7 +513,18 @@ interface ClaudeCompatibleProvider {
 **Pros**: Reuses existing UI and settings infrastructure
 **Cons**: The Claude provider would need to handle two API formats, increasing complexity
 
-### Pattern 4: Hybrid Approach
+### Pattern 4: LiteLLM Proxy as Universal Translator
+
+Run LiteLLM as a local/sidecar service that translates any provider into Anthropic format. This lets the existing Claude provider + `ClaudeCompatibleProvider` config reach any model:
+
+```
+Automaker → ClaudeProvider → LiteLLM (localhost:4000) → Any provider
+```
+
+**Pros**: Zero provider code changes, reuses existing UI/settings, supports 100+ providers
+**Cons**: Additional service dependency, operational complexity, another process to manage
+
+### Pattern 5: Hybrid Approach
 
 Combine patterns based on quality tier:
 
